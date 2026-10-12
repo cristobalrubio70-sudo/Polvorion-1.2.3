@@ -14,13 +14,10 @@ import random
 from datetime import date, datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore")
-try:
-    import openpyxl
-    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    OPENPYXL_OK = True
-except ImportError:
-    OPENPYXL_OK = False
+import zipfile
+import re
+import altair as alt
+from xml.sax.saxutils import escape as _xml_escape
 
 st.set_page_config(
     page_title="Sistema Polvorín Minero",
@@ -222,19 +219,23 @@ def _seed():
     for k in kpis_data:
         c.execute("INSERT OR REPLACE INTO kpis VALUES (?,?,?,?,?,?,?,?)", k)
 
-    # KPI historial simulado (6 meses)
-    for mes in range(6):
-        f = hoy - timedelta(days=30*(5-mes))
-        periodo = f.strftime("%Y-%m")
-        mejora  = mes * 0.15
-        vals = [("KPI-001",round(60+30*mejora,1)),("KPI-002",round(40+45*mejora,1)),
-                ("KPI-003",round(45-25*mejora,1)),("KPI-004",round(max(0,8-5*mejora),1)),
-                ("KPI-005",round(30+50*mejora,1)),("KPI-006",round(120-105*mejora,1)),
-                ("KPI-007",round(50+40*mejora,1)),("KPI-008",round(55+25*mejora,1)),
-                ("KPI-009",round(25-13*mejora,1)),("KPI-010",round(max(0,5-5*mejora),1))]
-        for kid, val in vals:
+    # KPI historial simulado (6 meses) — ritmos distintos para que se vean los 3 estados
+    ritmo = {"KPI-001": 1.25, "KPI-002": 0.90, "KPI-003": 1.10, "KPI-004": 0.60, "KPI-005": 0.80,
+             "KPI-006": 1.30, "KPI-007": 1.05, "KPI-008": 0.35, "KPI-009": 0.95, "KPI-010": 1.40}
+    for k in kpis_data:
+        kid, base_v, meta6_v, meta12_v, unidad_k = k[0], k[3], k[4], k[5], k[6]
+        for mes in range(6):
+            f = hoy - timedelta(days=30 * (5 - mes))
+            periodo = f.strftime("%Y-%m")
+            val = base_v + (meta6_v - base_v) * (mes / 5.0) * ritmo[kid]
+            if unidad_k in ("min", "N°/mes"):
+                val = max(val, meta12_v)
+            else:
+                val = min(val, meta12_v)
+            val = round(max(0.0, val), 1)
             c.execute("INSERT OR REPLACE INTO kpi_historial VALUES (?,?,?,?,?,?)",
-                      ("KHIST-"+kid+"-"+periodo, str(f), kid, val, periodo, "sistema"))
+                      ("KHIST-" + kid + "-" + periodo, str(f), kid, val, periodo, "sistema"))
+
 
     # Condiciones (24h)
     ahora = datetime.now()
@@ -796,44 +797,212 @@ def mod_traslados():
         st.success("✅ Ruta más eficiente: "+df_opt.loc[idx_min,"Ruta"])
         st.warning("⚠️ Ruta con mayor demora: "+df_opt.loc[idx_max,"Ruta"])
 
+# ── Generador de Excel (.xlsx) sin librerías externas ────────────────────────
+E_NORMAL, E_TITULO, E_SUB, E_HDR, E_CELDA = 0, 1, 2, 3, 4
+E_ROJO, E_AMAR, E_VERDE, E_AZUL, E_CREMA, E_NEGRITA = 5, 6, 7, 8, 9, 10
+
+_ESTILOS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    '<fonts count="5">'
+    '<font><sz val="10"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="14"/><color rgb="FF1F3864"/><name val="Calibri"/></font>'
+    '<font><i/><sz val="10"/><color rgb="FF595959"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="10"/><name val="Calibri"/></font>'
+    '</fonts>'
+    '<fills count="8">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFCCCC"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFBDD7EE"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/><bgColor indexed="64"/></patternFill></fill>'
+    '</fills>'
+    '<borders count="2">'
+    '<border><left/><right/><top/><bottom/><diagonal/></border>'
+    '<border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right>'
+    '<top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border>'
+    '</borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="11">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="0" fontId="3" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">'
+    '<alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1">'
+    '<alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="4" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="5" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="7" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '</cellXfs>'
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    '</styleSheet>'
+)
+
+def _col_letra(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _celda(v):
+    try:
+        if hasattr(v, "item"):
+            v = v.item()
+    except Exception:
+        pass
+    if v is None:
+        return ""
+    if isinstance(v, float) and v != v:
+        return ""
+    return v
+
+def _estilo_valor(v):
+    if not isinstance(v, str):
+        return E_CELDA
+    toks = set(re.findall(r"[A-ZÁÉÍÓÚÑ]+", v.upper()))
+    for claves, est in (({"CRITICA", "VENCIDO"}, E_ROJO), ({"ALTA", "VENCER"}, E_AMAR),
+                        ({"MEDIA", "DEVOLUCION"}, E_CREMA), ({"VIGENTE", "INGRESO"}, E_VERDE),
+                        ({"DESPACHO"}, E_AZUL)):
+        if toks & claves:
+            return est
+    return E_CELDA
+
+def hoja_df(nombre, df, titulo, sub="", norma=""):
+    filas = [[(titulo, E_TITULO)],
+             [(sub or ("Generado: " + datetime.now().strftime("%Y-%m-%d %H:%M")), E_SUB)]]
+    if norma:
+        filas.append([(norma, E_SUB)])
+    filas.append([])
+    cols = [str(c) for c in df.columns]
+    filas.append([(c, E_HDR) for c in cols])
+    anchos = [len(c) + 4 for c in cols]
+    for fila in df.itertuples(index=False):
+        out = []
+        for i, v in enumerate(fila):
+            v = _celda(v)
+            out.append((v, _estilo_valor(v)))
+            anchos[i] = max(anchos[i], min(len(str(v)) + 4, 40))
+        filas.append(out)
+    return {"nombre": nombre, "filas": filas, "anchos": [min(a, 40) for a in anchos]}
+
+def _hoja_xml(h):
+    p = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">']
+    if h.get("anchos"):
+        p.append("<cols>")
+        for i, w in enumerate(h["anchos"], 1):
+            p.append('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i, i, int(w)))
+        p.append("</cols>")
+    p.append("<sheetData>")
+    for r, fila in enumerate(h["filas"], 1):
+        p.append('<row r="%d">' % r)
+        for c, celda in enumerate(fila):
+            valor, estilo = celda if isinstance(celda, tuple) else (celda, E_NORMAL)
+            valor = _celda(valor)
+            ref = _col_letra(c) + str(r)
+            if isinstance(valor, bool):
+                valor = str(valor)
+            if isinstance(valor, (int, float)):
+                num = repr(valor) if isinstance(valor, float) else str(valor)
+                p.append('<c r="%s" s="%d"><v>%s</v></c>' % (ref, estilo, num))
+            elif valor == "":
+                p.append('<c r="%s" s="%d"/>' % (ref, estilo))
+            else:
+                t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(valor))
+                p.append('<c r="%s" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                         % (ref, estilo, _xml_escape(t)))
+        p.append("</row>")
+    p.append("</sheetData></worksheet>")
+    return "".join(p)
+
+def xlsx_crear(hojas):
+    """Devuelve los bytes de un .xlsx. hojas = [{'nombre','filas','anchos'}, ...]"""
+    nombres, usados = [], set()
+    for i, h in enumerate(hojas, 1):
+        n = re.sub(r"[\[\]:*?/\\]", "", h["nombre"])[:31] or ("Hoja" + str(i))
+        while n in usados:
+            n = n[:28] + "_" + str(i)
+        usados.add(n)
+        nombres.append(n)
+    n = len(hojas)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+              '<Default Extension="xml" ContentType="application/xml"/>'
+              '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+              '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>']
+        for i in range(1, n + 1):
+            ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+        ct.append("</Types>")
+        z.writestr("[Content_Types].xml", "".join(ct))
+        z.writestr("_rels/.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                   '</Relationships>')
+        wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+              'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>']
+        for i, nom in enumerate(nombres, 1):
+            wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_xml_escape(nom, {'"': "&quot;"}), i, i))
+        wb.append("</sheets></workbook>")
+        z.writestr("xl/workbook.xml", "".join(wb))
+        rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+        for i in range(1, n + 1):
+            rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>' % (i, i))
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' % (n + 1))
+        rels.append("</Relationships>")
+        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+        z.writestr("xl/styles.xml", _ESTILOS_XML)
+        for i, h in enumerate(hojas, 1):
+            z.writestr("xl/worksheets/sheet%d.xml" % i, _hoja_xml(h))
+    return buf.getvalue()
+
+
 def mod_reportes():
-    if not OPENPYXL_OK:
-        st.error("Falta la libreria openpyxl. Agrega una linea que diga openpyxl en el archivo requirements.txt del repositorio (nombre exacto: requirements.txt) y reinicia la app.")
-        return
     st.title("📋 Reportes")
-    st.info("Reportes listos para la Autoridad Fiscalizadora (DGMN/SERNAGEOMIN).")
-    tipo   = st.selectbox("Tipo",["Reporte mensual completo","Discrepancias","Movimientos","Condiciones","Flota"])
-    periodo= st.date_input("Período",value=date.today())
-    if st.button("📥 Generar Excel",type="primary"):
-        inv=get_inv(); inv["estado_calc"]=inv.apply(clasificar,axis=1)
-        movs=get_movs(); viajes=get_viajes(); cond=get_cond(); alertas=generar_alertas()
-        output=io.BytesIO(); wb=openpyxl.Workbook()
-        HF=PatternFill("solid",fgColor="1F3864"); FF=Font(bold=True,color="FFFFFF",size=10)
-        BD=Border(left=Side(style="thin"),right=Side(style="thin"),top=Side(style="thin"),bottom=Side(style="thin"))
-        FILL={"CRITICA":PatternFill("solid",fgColor="FFCCCC"),"ALTA":PatternFill("solid",fgColor="FFEB9C"),"VIGENTE":PatternFill("solid",fgColor="C6EFCE"),"VENCIDO":PatternFill("solid",fgColor="FFCCCC")}
-        def esc(ws,df,titulo):
-            ws.append([titulo]); ws.cell(1,1).font=Font(bold=True,size=13,color="1F3864")
-            ws.append(["Generado: "+datetime.now().strftime("%Y-%m-%d %H:%M")]); ws.append([]); ws.append(list(df.columns))
-            for ci,_ in enumerate(df.columns,1):
-                c=ws.cell(4,ci); c.fill=HF; c.font=FF; c.border=BD; c.alignment=Alignment(horizontal="center",wrap_text=True)
-            for ri,row in enumerate(df.itertuples(index=False),5):
-                for ci,val in enumerate(row,1):
-                    c=ws.cell(ri,ci,value=str(val) if val is not None else ""); c.border=BD; c.alignment=Alignment(wrap_text=True,vertical="center")
-                    vs=str(val).upper()
-                    for k2,f in FILL.items():
-                        if k2 in vs: c.fill=f; break
-            for col in ws.columns:
-                ml=max((len(str(c.value)) if c.value else 0) for c in col)
-                ws.column_dimensions[get_column_letter(col[0].column)].width=min(ml+4,40)
-        ws1=wb.active; ws1.title="Inventario"; esc(ws1,inv.drop(columns=["qr_data"],errors="ignore"),"INVENTARIO — "+str(periodo))
-        if tipo in ["Reporte mensual completo","Movimientos"]: ws2=wb.create_sheet("Movimientos"); esc(ws2,movs,"MOVIMIENTOS — "+str(periodo))
-        if tipo in ["Reporte mensual completo","Discrepancias"]:
-            ws3=wb.create_sheet("Alertas"); df_a=pd.DataFrame(alertas) if alertas else pd.DataFrame(columns=["gravedad","lote","exp","msg","accion"]); esc(ws3,df_a,"ALERTAS — "+str(periodo))
-        if tipo in ["Reporte mensual completo","Condiciones"]: ws4=wb.create_sheet("Condiciones"); esc(ws4,cond,"CONDICIONES — "+str(periodo))
-        if tipo in ["Reporte mensual completo","Flota"]: ws5=wb.create_sheet("Flota"); esc(ws5,viajes,"FLOTA — "+str(periodo))
-        wb.save(output); output.seek(0)
-        st.download_button(label="📥 Descargar "+tipo,data=output,file_name="reporte_polvorin_"+str(periodo)+".xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.success("✅ Reporte generado.")
+    st.info("Reportes listos para la Autoridad Fiscalizadora (DGMN/SERNAGEOMIN). Se generan en Excel (.xlsx).")
+    tipo = st.selectbox("Tipo", ["Reporte mensual completo", "Discrepancias", "Movimientos", "Condiciones", "Flota"])
+    periodo = st.date_input("Período", value=date.today())
+    if st.button("📥 Generar Excel", type="primary"):
+        inv = get_inv()
+        inv["estado_calc"] = inv.apply(clasificar, axis=1)
+        movs = get_movs()
+        viajes = get_viajes()
+        cond = get_cond()
+        alertas = generar_alertas()
+        hojas = [hoja_df("Inventario", inv.drop(columns=["qr_data"], errors="ignore"), "INVENTARIO — " + str(periodo))]
+        if tipo in ["Reporte mensual completo", "Movimientos"]:
+            hojas.append(hoja_df("Movimientos", movs, "MOVIMIENTOS — " + str(periodo)))
+        if tipo in ["Reporte mensual completo", "Discrepancias"]:
+            df_a = pd.DataFrame(alertas) if alertas else pd.DataFrame(columns=["gravedad", "icono", "lote", "exp", "msg", "accion"])
+            hojas.append(hoja_df("Alertas", df_a, "ALERTAS — " + str(periodo)))
+        if tipo in ["Reporte mensual completo", "Condiciones"]:
+            hojas.append(hoja_df("Condiciones", cond, "CONDICIONES AMBIENTALES — " + str(periodo)))
+        if tipo in ["Reporte mensual completo", "Flota"]:
+            hojas.append(hoja_df("Flota", viajes, "FLOTA Y TRASLADOS — " + str(periodo)))
+        st.session_state["rep_bytes"] = xlsx_crear(hojas)
+        st.session_state["rep_nombre"] = "reporte_polvorin_" + str(periodo) + ".xlsx"
+        st.session_state["rep_tipo"] = tipo
+    if st.session_state.get("rep_bytes"):
+        st.success("✅ Reporte generado: " + st.session_state.get("rep_tipo", ""))
+        st.download_button(label="📥 Descargar " + st.session_state.get("rep_tipo", "reporte"),
+                           data=st.session_state["rep_bytes"], file_name=st.session_state["rep_nombre"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 def mod_auditoria():
     st.title("🔍 Auditoría Física")
@@ -947,9 +1116,14 @@ def mod_manual():
 # PARTE 2 — MÓDULOS DE GESTIÓN Y ANÁLISIS
 # ══════════════════════════════════════════════════════════════════════════════
 KPI_ESCALA_ESTADO = {"Logrado": "#2E9E5B", "En progreso": "#F2B134", "Rezagado": "#D64545"}
+MENOR_ES_MEJOR = ("min", "N°/mes")
+
+def _escala_estado():
+    return alt.Scale(domain=list(KPI_ESCALA_ESTADO.keys()), range=list(KPI_ESCALA_ESTADO.values()))
 
 def progreso_kpi(base, meta, valor):
-    """Avance hacia la meta en %. Sirve para KPIs donde mas es mejor y donde menos es mejor."""
+    """Avance hacia la meta en %. 0% = en la línea base, 100% = meta alcanzada.
+    Funciona igual cuando más es mejor y cuando menos es mejor."""
     denom = float(meta) - float(base)
     if denom == 0:
         return 100.0 if float(valor) == float(meta) else 0.0
@@ -969,7 +1143,9 @@ def kpi_tabla():
     if kpis.empty:
         return pd.DataFrame(), pd.DataFrame(), kpis
     if not hist.empty:
-        h = hist.sort_values("fecha").groupby(["kpi_id", "periodo"], as_index=False).last()
+        hist = hist.copy()
+        hist["prio"] = (hist["registrado_por"] != "sistema").astype(int)
+        h = hist.sort_values(["fecha", "prio"]).groupby(["kpi_id", "periodo"], as_index=False).last()
     else:
         h = hist
     rows = []
@@ -994,8 +1170,125 @@ def kpi_evolucion(h, kpis):
         lambda r: min(100.0, progreso_kpi(r["valor_base"], r["meta_6m"], r["valor_real"])), axis=1)
     return m
 
+# ── Gráficos (funciones puras: devuelven un gráfico Altair) ──────────────────
+def ch_donut(dff, glob):
+    dist = dff["estado"].value_counts().reset_index()
+    dist.columns = ["estado", "n"]
+    donut = alt.Chart(dist).mark_arc(innerRadius=60, outerRadius=100).encode(
+        theta=alt.Theta("n:Q"),
+        color=alt.Color("estado:N", scale=_escala_estado(), legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=["estado:N", "n:Q"])
+    centro = alt.Chart(pd.DataFrame({"t": [str(round(glob)) + "%"]})).mark_text(
+        size=30, fontWeight="bold", color="#1F3864").encode(text="t:N")
+    return (donut + centro).properties(height=270)
+
+def ch_barras_avance(dff):
+    orden = dff.sort_values("progreso", ascending=False)["kpi"].tolist()
+    base_c = alt.Chart(dff)
+    barras = base_c.mark_bar(cornerRadiusEnd=4, size=18).encode(
+        y=alt.Y("kpi:N", sort=orden, title=None, axis=alt.Axis(labelLimit=300)),
+        x=alt.X("progreso:Q", title="Avance hacia la meta (%)", scale=alt.Scale(domain=[0, 150])),
+        color=alt.Color("estado:N", scale=_escala_estado(), legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=["kpi:N", "area:N", "base:Q", "actual:Q", "meta6:Q", "meta12:Q", "unidad:N", "progreso:Q"])
+    etiquetas = base_c.mark_text(align="left", dx=4, color="#333").encode(
+        y=alt.Y("kpi:N", sort=orden), x="progreso:Q", text=alt.Text("progreso:Q", format=".0f"))
+    linea100 = alt.Chart(pd.DataFrame({"x": [100]})).mark_rule(
+        color="#1F3864", strokeDash=[6, 4], size=2).encode(x="x:Q")
+    return (barras + etiquetas + linea100).properties(height=max(260, 36 * len(dff)))
+
+def ch_evolucion_global(g):
+    g = g.copy()
+    g["etq"] = g["progreso"].round(0).astype(int).astype(str) + "%"
+    b = alt.Chart(g)
+    area = b.mark_area(opacity=0.2, color="#2E75B6").encode(
+        x=alt.X("periodo:O", title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("progreso:Q", title="Cumplimiento global (%)", scale=alt.Scale(domain=[0, 115])))
+    linea = b.mark_line(color="#1F3864", point=alt.OverlayMarkDef(color="#1F3864", size=60)).encode(
+        x="periodo:O", y="progreso:Q",
+        tooltip=[alt.Tooltip("periodo:O", title="Período"), alt.Tooltip("progreso:Q", title="Cumplimiento (%)", format=".1f")])
+    etq = b.mark_text(dy=-12, fontWeight="bold", color="#1F3864").encode(x="periodo:O", y="progreso:Q", text="etq:N")
+    meta = alt.Chart(pd.DataFrame({"y": [100]})).mark_rule(color="#2E9E5B", strokeDash=[6, 4], size=2).encode(y="y:Q")
+    meta_t = alt.Chart(pd.DataFrame({"y": [100], "t": ["Meta a 6 meses = 100%"]})).mark_text(
+        align="left", dy=-8, color="#2E9E5B", fontWeight="bold").encode(y="y:Q", text="t:N", x=alt.value(4))
+    return (area + linea + etq + meta + meta_t).properties(height=290)
+
+def ch_spark(hk, meta6, color):
+    vals = list(hk["valor_real"]) + [meta6]
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * 0.15 or 1.0
+    esc = alt.Scale(zero=False, domain=[lo - pad, hi + pad])
+    lin = alt.Chart(hk).mark_line(point=alt.OverlayMarkDef(color=color), color=color).encode(
+        x=alt.X("periodo:O", axis=None), y=alt.Y("valor_real:Q", axis=None, scale=esc),
+        tooltip=[alt.Tooltip("periodo:O", title="Período"), alt.Tooltip("valor_real:Q", title="Valor")])
+    meta = alt.Chart(pd.DataFrame({"y": [meta6]})).mark_rule(
+        strokeDash=[4, 3], color="#2E9E5B", size=1.5).encode(y=alt.Y("y:Q", axis=None, scale=esc))
+    return (lin + meta).properties(height=75)
+
+def ch_comparacion(r):
+    etapas = ["Línea base", "Actual", "Meta 6 meses", "Meta 12 meses"]
+    comp = pd.DataFrame({"Etapa": etapas, "Valor": [r["base"], r["actual"], r["meta6"], r["meta12"]]})
+    esc = alt.Scale(domain=etapas, range=["#9AA5B1", "#2E75B6", "#F2B134", "#2E9E5B"])
+    cols = alt.Chart(comp).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=alt.X("Etapa:N", sort=etapas, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("Valor:Q", title=r["unidad"]),
+        color=alt.Color("Etapa:N", scale=esc, legend=None), tooltip=["Etapa:N", "Valor:Q"])
+    txt = alt.Chart(comp).mark_text(dy=-8, fontWeight="bold").encode(
+        x=alt.X("Etapa:N", sort=etapas), y="Valor:Q", text=alt.Text("Valor:Q", format=".1f"))
+    return (cols + txt).properties(height=300)
+
+def ch_evolucion_kpi(hk, r):
+    dom = ["Línea base", "Meta 6 meses", "Meta 12 meses"]
+    esc = alt.Scale(domain=dom, range=["#9AA5B1", "#F2B134", "#2E9E5B"])
+    lin = alt.Chart(hk).mark_line(point=True, color="#2E75B6").encode(
+        x=alt.X("periodo:O", title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("valor_real:Q", title=r["unidad"]),
+        tooltip=[alt.Tooltip("periodo:O", title="Período"), alt.Tooltip("valor_real:Q", title="Valor")])
+    refs = pd.DataFrame({"y": [r["base"], r["meta6"], r["meta12"]], "Referencia": dom})
+    reglas = alt.Chart(refs).mark_rule(strokeDash=[5, 4], size=2).encode(
+        y="y:Q", color=alt.Color("Referencia:N", scale=esc, legend=None))
+    etiq = alt.Chart(refs).mark_text(align="left", dy=-6, fontWeight="bold").encode(
+        y="y:Q", x=alt.value(4), text="Referencia:N", color=alt.Color("Referencia:N", scale=esc, legend=None))
+    return (lin + reglas + etiq).properties(height=300)
+
+def ch_mov_dia(g):
+    esc = alt.Scale(domain=["Ingreso", "Despacho", "Devolucion"], range=["#2E9E5B", "#2E75B6", "#F2B134"])
+    tope = int(g.groupby("fecha")["n"].sum().max()) if not g.empty else 1
+    return alt.Chart(g).mark_bar(size=34).encode(
+        x=alt.X("fecha:O", title="Día", axis=alt.Axis(labelAngle=-30)),
+        y=alt.Y("n:Q", title="N° de movimientos", axis=alt.Axis(values=list(range(0, tope + 1)), format="d")),
+        color=alt.Color("tipo_mov:N", scale=esc, legend=alt.Legend(title="Tipo", orient="bottom")),
+        tooltip=[alt.Tooltip("fecha:O", title="Día"), alt.Tooltip("tipo_mov:N", title="Tipo"), alt.Tooltip("n:Q", title="Movimientos")]
+    ).properties(height=280)
+
+def ch_mov_explosivo(u):
+    esc = alt.Scale(domain=["Ingreso", "Despacho", "Devolucion"], range=["#2E9E5B", "#2E75B6", "#F2B134"])
+    return alt.Chart(u).mark_bar().encode(
+        x=alt.X("explosivo:N", title=None, axis=alt.Axis(labelAngle=0)),
+        xOffset="tipo_mov:N",
+        y=alt.Y("unidades:Q", title="Unidades (sacos / cajas / rollos)"),
+        color=alt.Color("tipo_mov:N", scale=esc, legend=alt.Legend(title="Tipo", orient="bottom")),
+        tooltip=[alt.Tooltip("explosivo:N", title="Explosivo"), alt.Tooltip("tipo_mov:N", title="Tipo"), alt.Tooltip("unidades:Q", title="Unidades")]
+    ).properties(height=280)
+
+def _tarjeta_kpi(r, h):
+    color = KPI_ESCALA_ESTADO[r["estado"]]
+    direccion = "↓ menor es mejor" if r["unidad"] in MENOR_ES_MEJOR else "↑ mayor es mejor"
+    ancho = str(min(100, int(round(r["progreso"]))))
+    st.markdown(
+        '<div style="font-weight:600;font-size:.92em;color:#1F3864;line-height:1.25;">' + r["kpi"] + '</div>'
+        '<div style="font-size:.74em;color:#777;margin-bottom:4px;">' + r["area"] + ' · ' + direccion + '</div>'
+        '<div style="font-size:1.9em;font-weight:700;color:' + color + ';line-height:1.1;">' + str(r["actual"]) +
+        ' <span style="font-size:.42em;color:#777;font-weight:400;">' + r["unidad"] + '</span></div>'
+        '<div style="background:#E6E9ED;border-radius:6px;height:9px;margin:6px 0 3px 0;">'
+        '<div style="background:' + color + ';width:' + ancho + '%;height:9px;border-radius:6px;"></div></div>'
+        '<div style="font-size:.76em;color:#555;">Avance <b>' + str(round(r["progreso"])) + '%</b> · base ' + str(r["base"]) +
+        ' → meta ' + str(r["meta6"]) + ' · <b style="color:' + color + '">' + r["estado"] + '</b></div>',
+        unsafe_allow_html=True)
+    hk = h[h["kpi_id"] == r["id"]].sort_values("periodo") if not h.empty else pd.DataFrame()
+    if not hk.empty:
+        st.altair_chart(ch_spark(hk, r["meta6"], color), use_container_width=True)
+
 def mod_kpis():
-    import altair as alt
     st.title("📊 KPIs — Panel de Cumplimiento")
     st.caption("⚠️ Línea base, metas y evolución mensual son valores hipotéticos del caso simulado. "
                "Reemplazar con mediciones reales al implementar en faena (formulario al final de esta página).")
@@ -1010,14 +1303,22 @@ def mod_kpis():
         st.warning("Sin KPIs configurados.")
         return
 
+    with st.expander("ℹ️ Cómo leer este panel", expanded=True):
+        st.markdown(
+            "- **Avance (%)** mide qué tan cerca está cada KPI de su meta a 6 meses: "
+            "**0% = igual que la línea base (sin sistema)**, **100% = meta alcanzada**, más de 100% = meta superada.\n"
+            "- Sirve igual para KPIs donde **más es mejor** (ej. % de lotes registrados) y donde **menos es mejor** "
+            "(ej. minutos de inventario): en ambos casos, más avance = mejor.\n"
+            "- **Colores:** 🟢 Logrado (100% o más) · 🟡 En progreso (50% a 99%) · 🔴 Rezagado (menos de 50%).\n"
+            "- **Cumplimiento global** = promedio del avance de los KPIs en vista (cada KPI se topa en 100%).")
+
     areas = sorted(df["area"].unique().tolist())
     sel = st.multiselect("Segmentador · Área", areas, default=areas)
     dff = df[df["area"].isin(sel)] if sel else df.iloc[0:0]
     if dff.empty:
         st.info("Selecciona al menos un área.")
         return
-
-    escala = alt.Scale(domain=list(KPI_ESCALA_ESTADO.keys()), range=list(KPI_ESCALA_ESTADO.values()))
+    st.caption("Mostrando " + str(len(dff)) + " de " + str(len(df)) + " KPIs")
     glob = float(dff["progreso"].clip(upper=100).mean())
 
     def tarjeta(col, valor, etiqueta, color):
@@ -1027,101 +1328,75 @@ def mod_kpis():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     tarjeta(c1, len(dff), "KPIs en vista", "#1F3864")
-    tarjeta(c2, len(dff[dff["estado"] == "Logrado"]), "✅ Logrados", "#2E9E5B")
-    tarjeta(c3, len(dff[dff["estado"] == "En progreso"]), "⚡ En progreso", "#F2B134")
-    tarjeta(c4, len(dff[dff["estado"] == "Rezagado"]), "❌ Rezagados", "#D64545")
+    tarjeta(c2, len(dff[dff["estado"] == "Logrado"]), "🟢 Logrados", "#2E9E5B")
+    tarjeta(c3, len(dff[dff["estado"] == "En progreso"]), "🟡 En progreso", "#F2B134")
+    tarjeta(c4, len(dff[dff["estado"] == "Rezagado"]), "🔴 Rezagados", "#D64545")
     tarjeta(c5, str(round(glob)) + "%", "Cumplimiento global", "#2E75B6")
     st.markdown("")
 
     col_a, col_b = st.columns([1, 2])
     with col_a:
         st.markdown("**Estado de los KPIs**")
-        dist = dff["estado"].value_counts().reset_index()
-        dist.columns = ["estado", "n"]
-        donut = alt.Chart(dist).mark_arc(innerRadius=60, outerRadius=100).encode(
-            theta=alt.Theta("n:Q"),
-            color=alt.Color("estado:N", scale=escala, legend=alt.Legend(title=None, orient="bottom")),
-            tooltip=["estado:N", "n:Q"])
-        centro = alt.Chart(pd.DataFrame({"t": [str(round(glob)) + "%"]})).mark_text(
-            size=30, fontWeight="bold", color="#1F3864").encode(text="t:N")
-        st.altair_chart((donut + centro).properties(height=270), use_container_width=True)
+        st.altair_chart(ch_donut(dff, glob), use_container_width=True)
     with col_b:
-        st.markdown("**Avance hacia la meta a 6 meses** (la línea punteada = 100% = meta alcanzada)")
-        orden = dff.sort_values("progreso", ascending=False)["kpi"].tolist()
-        base_c = alt.Chart(dff)
-        barras = base_c.mark_bar(cornerRadiusEnd=4, size=18).encode(
-            y=alt.Y("kpi:N", sort=orden, title=None, axis=alt.Axis(labelLimit=300)),
-            x=alt.X("progreso:Q", title="Avance (%)", scale=alt.Scale(domain=[0, 150])),
-            color=alt.Color("estado:N", scale=escala, legend=alt.Legend(title=None, orient="bottom")),
-            tooltip=["kpi:N", "area:N", "base:Q", "actual:Q", "meta6:Q", "meta12:Q", "unidad:N", "progreso:Q"])
-        etiquetas = base_c.mark_text(align="left", dx=4, color="#333").encode(
-            y=alt.Y("kpi:N", sort=orden), x="progreso:Q", text=alt.Text("progreso:Q", format=".0f"))
-        linea100 = alt.Chart(pd.DataFrame({"x": [100]})).mark_rule(
-            color="#1F3864", strokeDash=[6, 4], size=2).encode(x="x:Q")
-        st.altair_chart((barras + etiquetas + linea100).properties(height=max(240, 34 * len(dff))),
-                        use_container_width=True)
+        st.markdown("**Avance de cada KPI hacia su meta a 6 meses** (línea punteada = 100%)")
+        st.altair_chart(ch_barras_avance(dff), use_container_width=True)
 
     st.markdown("**Evolución del cumplimiento global por mes**")
+    st.caption("Promedio mensual del avance de los KPIs en vista. Si la línea llega a la meta punteada (100%), "
+               "el conjunto de KPIs cumplió lo esperado a 6 meses.")
     evo = kpi_evolucion(h, kpis)
     if not evo.empty:
         evo = evo[evo["area"].isin(sel)]
     if not evo.empty:
         g = evo.groupby("periodo", as_index=False)["progreso"].mean()
-        area_c = alt.Chart(g).mark_area(opacity=0.25, color="#2E75B6").encode(
-            x=alt.X("periodo:O", title="Período"),
-            y=alt.Y("progreso:Q", title="Cumplimiento global (%)", scale=alt.Scale(domain=[0, 100])))
-        linea_c = alt.Chart(g).mark_line(color="#1F3864", point=True).encode(
-            x="periodo:O", y="progreso:Q", tooltip=["periodo:O", alt.Tooltip("progreso:Q", format=".1f")])
-        st.altair_chart((area_c + linea_c).properties(height=240), use_container_width=True)
+        st.altair_chart(ch_evolucion_global(g), use_container_width=True)
     else:
         st.info("Sin historial disponible para las áreas seleccionadas.")
+
+    st.divider()
+    st.subheader("🧩 Tablero de todos los KPIs")
+    st.caption("Cada tarjeta: valor actual, avance hacia la meta a 6 meses y tendencia mensual "
+               "(línea punteada verde = meta a 6 meses).")
+    filas_kpi = [dff.iloc[i:i + 3] for i in range(0, len(dff), 3)]
+    for bloque in filas_kpi:
+        cols = st.columns(3)
+        for col, (_, r) in zip(cols, bloque.iterrows()):
+            with col:
+                with st.container(border=True):
+                    _tarjeta_kpi(r, h)
 
     st.divider()
     st.subheader("🔎 Detalle por KPI")
     kpi_sel = st.selectbox("Selecciona un KPI", dff["kpi"].tolist())
     r = dff[dff["kpi"] == kpi_sel].iloc[0]
-    st.caption(r["descripcion"] + " · Unidad: " + r["unidad"])
+    direccion = "menos es mejor: la meta es un valor MÁS BAJO que la base" if r["unidad"] in MENOR_ES_MEJOR \
+        else "más es mejor: la meta es un valor MÁS ALTO que la base"
+    st.caption(r["descripcion"] + " · Unidad: " + r["unidad"] + " · En este KPI " + direccion + ".")
     d1, d2 = st.columns(2)
-    etapas = ["Línea base", "Actual", "Meta 6 meses", "Meta 12 meses"]
     with d1:
-        st.markdown("**Base vs actual vs metas**")
-        comp = pd.DataFrame({"Etapa": etapas, "Valor": [r["base"], r["actual"], r["meta6"], r["meta12"]]})
-        escala_e = alt.Scale(domain=etapas, range=["#9AA5B1", "#2E75B6", "#F2B134", "#2E9E5B"])
-        cols_c = alt.Chart(comp).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
-            x=alt.X("Etapa:N", sort=etapas, title=None, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("Valor:Q", title=r["unidad"]),
-            color=alt.Color("Etapa:N", scale=escala_e, legend=None),
-            tooltip=["Etapa:N", "Valor:Q"])
-        txt = alt.Chart(comp).mark_text(dy=-8, fontWeight="bold").encode(
-            x=alt.X("Etapa:N", sort=etapas), y="Valor:Q", text=alt.Text("Valor:Q", format=".1f"))
-        st.altair_chart((cols_c + txt).properties(height=300), use_container_width=True)
+        st.markdown("**Línea base vs valor actual vs metas**")
+        st.altair_chart(ch_comparacion(r), use_container_width=True)
     with d2:
-        st.markdown("**Evolución mensual vs referencias**")
+        st.markdown("**Evolución mensual y líneas de referencia**")
         hk = h[h["kpi_id"] == r["id"]].sort_values("periodo") if not h.empty else pd.DataFrame()
         if hk.empty:
             st.info("Sin historial para este KPI.")
         else:
-            lin = alt.Chart(hk).mark_line(point=True, color="#2E75B6").encode(
-                x=alt.X("periodo:O", title="Período"),
-                y=alt.Y("valor_real:Q", title=r["unidad"]),
-                tooltip=["periodo:O", "valor_real:Q"])
-            refs = pd.DataFrame({"y": [r["base"], r["meta6"], r["meta12"]],
-                                 "Referencia": ["Línea base", "Meta 6 meses", "Meta 12 meses"]})
-            reglas = alt.Chart(refs).mark_rule(strokeDash=[5, 4], size=2).encode(
-                y="y:Q",
-                color=alt.Color("Referencia:N", legend=alt.Legend(title=None, orient="bottom"),
-                                scale=alt.Scale(domain=["Línea base", "Meta 6 meses", "Meta 12 meses"],
-                                                range=["#9AA5B1", "#F2B134", "#2E9E5B"])))
-            st.altair_chart((lin + reglas).properties(height=300), use_container_width=True)
+            st.altair_chart(ch_evolucion_kpi(hk, r), use_container_width=True)
 
     st.divider()
     st.subheader("📋 Tabla de KPIs")
     tabla = dff[["kpi", "area", "unidad", "base", "actual", "meta6", "meta12", "progreso", "estado"]].rename(
         columns={"kpi": "KPI", "area": "Área", "unidad": "Unidad", "base": "Base", "actual": "Actual",
                  "meta6": "Meta 6m", "meta12": "Meta 12m", "progreso": "Avance (%)", "estado": "Estado"})
-    st.dataframe(tabla, use_container_width=True, hide_index=True,
-                 column_config={"Avance (%)": st.column_config.ProgressColumn(
-                     "Avance (%)", min_value=0, max_value=150, format="%.0f")})
+
+    def color_estado(v):
+        return {"Logrado": "background-color:#C6EFCE;color:#1F5C1F",
+                "En progreso": "background-color:#FFEB9C;color:#7F6000",
+                "Rezagado": "background-color:#FFCCCC;color:#C00000"}.get(v, "")
+
+    st.dataframe(tabla.style.map(color_estado, subset=["Estado"]), use_container_width=True, hide_index=True)
 
     if puede("kpis") or puede("todo"):
         st.divider()
@@ -1160,13 +1435,24 @@ def mod_vista_rol():
             c2.metric("Ingresos",len(movs_h[movs_h["tipo_mov"]=="Ingreso"]) if not movs_h.empty else 0)
             c3.metric("Despachos",len(movs_h[movs_h["tipo_mov"]=="Despacho"]) if not movs_h.empty else 0)
             c4.metric("Viajes hoy",len(vj_h))
-            if not movs.empty:
-                movs2=movs.copy(); movs2["fecha"]=movs2["fecha_hora"].str[:10]
-                movs30=movs2[movs2["fecha"]>=str(date.today()-timedelta(days=30))]
-                if not movs30.empty:
-                    st.subheader("Movimientos por tipo (últimos 30 días)")
-                    tabla_m=movs30.groupby(["fecha","tipo_mov"]).size().unstack(fill_value=0)
-                    st.line_chart(tabla_m, use_container_width=True)
+            st.subheader("Movimientos de explosivos (últimos 60 días)")
+            st.caption("Cómo leerlo: cada barra es un día y su altura es el N° de movimientos registrados, "
+                       "separados por tipo (ingreso, despacho, devolución). Con pocos datos simulados habrá pocas barras: "
+                       "cada ingreso o despacho que registres aparecerá aquí.")
+            if movs.empty:
+                st.info("Sin movimientos registrados.")
+            else:
+                m2 = movs.copy()
+                m2["fecha"] = m2["fecha_hora"].str[:10]
+                m60 = m2[m2["fecha"] >= str(date.today() - timedelta(days=60))]
+                if m60.empty:
+                    st.info("Sin movimientos en los últimos 60 días.")
+                else:
+                    g = m60.groupby(["fecha", "tipo_mov"]).size().reset_index(name="n")
+                    st.altair_chart(ch_mov_dia(g), use_container_width=True)
+                    u = m60.groupby(["explosivo", "tipo_mov"], as_index=False)["cantidad"].sum().rename(columns={"cantidad": "unidades"})
+                    st.markdown("**Unidades movidas por explosivo** (comparación ingreso vs despacho vs devolución)")
+                    st.altair_chart(ch_mov_explosivo(u), use_container_width=True)
         with tab2:
             if not inv.empty:
                 inv_c=inv.copy(); inv_c["estado_calc"]=inv_c.apply(clasificar,axis=1)
@@ -1208,68 +1494,68 @@ def mod_vista_rol():
             st.dataframe(inv_c[inv_c["estado_calc"]=="Vigente"][["id_lote","explosivo","cantidad","unidad","fecha_vencimiento","almacen"]], use_container_width=True, hide_index=True)
 
 def mod_libro_control():
-    if not OPENPYXL_OK:
-        st.error("Falta la libreria openpyxl. Agrega una linea que diga openpyxl en el archivo requirements.txt del repositorio (nombre exacto: requirements.txt) y reinicia la app.")
-        return
     st.title("📋 Libro de Control — Exportación Oficial AF")
     st.info("Genera el libro de control mensual en formato para la Autoridad Fiscalizadora (DGMN/SERNAGEOMIN).")
-    c1,c2=st.columns(2)
-    mes_sel =c1.selectbox("Mes",["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"],index=date.today().month-1)
-    anio_sel=c2.number_input("Año",min_value=2024,max_value=2030,value=date.today().year)
-    if st.button("📥 Generar Libro Control Excel",type="primary"):
-        movs=get_movs(); inv=get_inv(); acc=get_accesos()
-        output=io.BytesIO(); wb=openpyxl.Workbook()
-        HF=PatternFill("solid",fgColor="1F3864"); FF=Font(bold=True,color="FFFFFF",size=10)
-        BD=Border(left=Side(style="thin"),right=Side(style="thin"),top=Side(style="thin"),bottom=Side(style="thin"))
-        FILL={"INGRESO":PatternFill("solid",fgColor="C6EFCE"),"DESPACHO":PatternFill("solid",fgColor="BDD7EE"),"DEVOLUCION":PatternFill("solid",fgColor="FFF2CC"),"VENCIDO":PatternFill("solid",fgColor="FFCCCC")}
-        def esc_af(ws,df,titulo,sub=""):
-            ws.merge_cells("A1:K1"); ws["A1"]=titulo; ws["A1"].font=Font(bold=True,size=14,color="1F3864"); ws["A1"].alignment=Alignment(horizontal="center")
-            ws.merge_cells("A2:K2"); ws["A2"]=sub or "Período: "+mes_sel+" "+str(anio_sel)+" | Generado: "+datetime.now().strftime("%Y-%m-%d %H:%M"); ws["A2"].font=Font(italic=True,size=10,color="595959"); ws["A2"].alignment=Alignment(horizontal="center")
-            ws.merge_cells("A3:K3"); ws["A3"]="Normativa: DS N°132 SERNAGEOMIN · Ley N°17.798 · Resolución DGMN N°003048/2020"; ws["A3"].font=Font(italic=True,size=9,color="808080"); ws["A3"].alignment=Alignment(horizontal="center")
-            ws.append([]); ws.append(list(df.columns))
-            for ci,_ in enumerate(df.columns,1):
-                c=ws.cell(5,ci); c.fill=HF; c.font=FF; c.border=BD; c.alignment=Alignment(horizontal="center",wrap_text=True)
-            for ri,row in enumerate(df.itertuples(index=False),6):
-                for ci,val in enumerate(row,1):
-                    c=ws.cell(ri,ci,value=str(val) if val is not None else ""); c.border=BD; c.alignment=Alignment(wrap_text=True,vertical="center")
-                    vs=str(val).upper()
-                    for k2,f in FILL.items():
-                        if k2 in vs: c.fill=f; break
-            for col in ws.columns:
-                ml=max((len(str(c.value)) if c.value else 0) for c in col)
-                ws.column_dimensions[get_column_letter(col[0].column)].width=min(ml+4,40)
-            ws.row_dimensions[1].height=25; ws.row_dimensions[5].height=20
-        ws1=wb.active; ws1.title="Libro de Movimientos"
-        mov_c=["id_mov","id_lote","explosivo","tipo_mov","cantidad","fecha_hora","operador","destino","n_orden","turno","observaciones"]
-        esc_af(ws1,movs[[c for c in mov_c if c in movs.columns]] if not movs.empty else movs,"LIBRO DE CONTROL DE EXPLOSIVOS — "+mes_sel.upper()+" "+str(anio_sel),"Faena hipotética · Consumidor Habitual · Ley N°17.798")
-        ws2=wb.create_sheet("Inventario al Cierre"); esc_af(ws2,inv.drop(columns=["qr_data"],errors="ignore"),"INVENTARIO AL CIERRE DEL PERÍODO","Estado al "+str(date.today()))
-        ws3=wb.create_sheet("Control de Accesos")
-        acc_c=["id","operador","tipo","fecha_hora","motivo","turno"]
-        esc_af(ws3,acc[[c for c in acc_c if c in acc.columns]] if not acc.empty else acc,"REGISTRO DE ACCESOS AL POLVORÍN","Control de personal — máx. 5 personas simultáneas (DS 132)")
-        ws4=wb.create_sheet("Resumen Ejecutivo")
-        def ce(kw): return len(inv[inv["estado"].str.upper().str.contains(kw,na=False)]) if not inv.empty and "estado" in inv.columns else 0
-        for fi,fila in enumerate([
-            ["RESUMEN EJECUTIVO — LIBRO DE CONTROL MENSUAL",""],["Período",mes_sel+" "+str(anio_sel)],
-            ["Fecha",datetime.now().strftime("%Y-%m-%d %H:%M")],["Generado por",st.session_state.get("nombre","")],["",""],
-            ["INVENTARIO",""],["Total lotes",len(inv)],["Peso total (kg)",round(inv["peso_kg_total"].sum() if not inv.empty else 0,2)],
-            ["Vigentes",ce("VIGENTE")],["Vencidos",ce("VENCIDO")],["",""],
-            ["MOVIMIENTOS",""],["Total",len(movs)],
-            ["Ingresos",len(movs[movs["tipo_mov"]=="Ingreso"]) if not movs.empty else 0],
-            ["Despachos",len(movs[movs["tipo_mov"]=="Despacho"]) if not movs.empty else 0],
-            ["Devoluciones",len(movs[movs["tipo_mov"]=="Devolucion"]) if not movs.empty else 0],["",""],
-            ["ACCESOS",""],["Total accesos",len(acc)],["",""],
-            ["NORMATIVA",""],["DS N°132 SERNAGEOMIN","Reglamento de Seguridad Minera"],
-            ["Ley N°17.798","Control de Armas y Explosivos"],["Resolución DGMN N°003048/2020","Almacenamiento productos Ley 17.798"],
-        ],1):
-            ws4.append(fila)
-            if fi==1: ws4["A1"].font=Font(bold=True,size=14,color="1F3864")
-        ws4.column_dimensions["A"].width=38; ws4.column_dimensions["B"].width=50
-        ws4.append(["",""]); ws4.append(["",""]); ws4.append(["Firma: ___________________________",""])
-        ws4.append(["Nombre: "+st.session_state.get("nombre",""),""]); ws4.append(["Cargo: Encargado de Polvorín",""]); ws4.append(["Fecha: "+str(date.today()),""])
-        wb.save(output); output.seek(0)
-        nombre_a="libro_control_"+mes_sel+"_"+str(anio_sel)+".xlsx"
-        st.download_button(label="📥 Descargar Libro Control — "+mes_sel+" "+str(anio_sel),data=output,file_name=nombre_a,mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    c1, c2 = st.columns(2)
+    mes_sel = c1.selectbox("Mes", ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
+                                   "Septiembre", "Octubre", "Noviembre", "Diciembre"], index=date.today().month - 1)
+    anio_sel = c2.number_input("Año", min_value=2024, max_value=2030, value=date.today().year)
+    if st.button("📥 Generar Libro Control Excel", type="primary"):
+        movs = get_movs()
+        inv = get_inv()
+        acc = get_accesos()
+        norma = "Normativa: DS N°132 SERNAGEOMIN · Ley N°17.798 · Resolución DGMN N°003048/2020"
+        mov_c = ["id_mov", "id_lote", "explosivo", "tipo_mov", "cantidad", "fecha_hora", "operador",
+                 "destino", "n_orden", "turno", "observaciones"]
+        acc_c = ["id", "operador", "tipo", "fecha_hora", "motivo", "turno"]
+        h1 = hoja_df("Libro de Movimientos", movs[[c for c in mov_c if c in movs.columns]] if not movs.empty else movs,
+                     "LIBRO DE CONTROL DE EXPLOSIVOS — " + mes_sel.upper() + " " + str(anio_sel),
+                     "Faena hipotética · Consumidor Habitual · Ley N°17.798", norma)
+        h2 = hoja_df("Inventario al Cierre", inv.drop(columns=["qr_data"], errors="ignore"),
+                     "INVENTARIO AL CIERRE DEL PERÍODO", "Estado al " + str(date.today()), norma)
+        h3 = hoja_df("Control de Accesos", acc[[c for c in acc_c if c in acc.columns]] if not acc.empty else acc,
+                     "REGISTRO DE ACCESOS AL POLVORÍN", "Control de personal — máx. 5 personas simultáneas (DS 132)", norma)
+
+        def ce(kw):
+            if inv.empty or "estado" not in inv.columns:
+                return 0
+            return len(inv[inv["estado"].str.upper().str.contains(kw, na=False)])
+
+        def n_tipo(t):
+            return len(movs[movs["tipo_mov"] == t]) if not movs.empty else 0
+
+        sec = lambda t: [(t, E_NEGRITA)]
+        filas = [
+            [("RESUMEN EJECUTIVO — LIBRO DE CONTROL MENSUAL", E_TITULO)],
+            ["Período", mes_sel + " " + str(anio_sel)],
+            ["Fecha", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ["Generado por", st.session_state.get("nombre", "")], [],
+            sec("INVENTARIO"), ["Total lotes", len(inv)],
+            ["Peso total (kg)", round(float(inv["peso_kg_total"].sum()), 2) if not inv.empty else 0],
+            ["Vigentes", ce("VIGENTE")], ["Vencidos", ce("VENCIDO")], [],
+            sec("MOVIMIENTOS"), ["Total", len(movs)], ["Ingresos", n_tipo("Ingreso")],
+            ["Despachos", n_tipo("Despacho")], ["Devoluciones", n_tipo("Devolucion")], [],
+            sec("ACCESOS"), ["Total accesos", len(acc)], [],
+            sec("NORMATIVA"),
+            ["DS N°132 SERNAGEOMIN", "Reglamento de Seguridad Minera"],
+            ["Ley N°17.798", "Control de Armas y Explosivos"],
+            ["Resolución DGMN N°003048/2020", "Almacenamiento productos Ley 17.798"],
+            [], [],
+            ["Firma: ___________________________"],
+            ["Nombre: " + str(st.session_state.get("nombre", ""))],
+            ["Cargo: Encargado de Polvorín"],
+            ["Fecha: " + str(date.today())],
+        ]
+        h4 = {"nombre": "Resumen Ejecutivo", "filas": filas, "anchos": [38, 50]}
+        st.session_state["libro_bytes"] = xlsx_crear([h1, h2, h3, h4])
+        st.session_state["libro_nombre"] = "libro_control_" + mes_sel + "_" + str(anio_sel) + ".xlsx"
+        st.session_state["libro_label"] = mes_sel + " " + str(anio_sel)
+    if st.session_state.get("libro_bytes"):
         st.success("✅ Libro de control generado · 4 hojas: Movimientos, Inventario, Accesos, Resumen.")
+        st.download_button(label="📥 Descargar Libro Control — " + st.session_state.get("libro_label", ""),
+                           data=st.session_state["libro_bytes"], file_name=st.session_state["libro_nombre"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 def mod_asistente_ia():
     st.title("🤖 Asistente IA — Apoyo Operativo")
